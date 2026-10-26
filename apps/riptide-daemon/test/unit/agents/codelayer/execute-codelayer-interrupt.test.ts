@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 import { startState, userMessage } from '@humanlayer/agentlayer-core'
 import { Effect } from 'effect'
 import { afterEach, describe, expect, test, vi } from 'vitest'
@@ -21,6 +23,10 @@ const mockCreateCodelayerAgent = vi.fn(async () => ({
 	run: vi.fn(() => createAgentRun()),
 }))
 const mockResolveModel = vi.fn(async () => ({ id: 'mock-model' }))
+const mockAuthGet = vi.fn(async () => ({ kind: 'oauth', accessToken: 'test-token', accountId: 'test-account' }))
+vi.mock('@humanlayer/agentlayer-provider-auth', () => ({
+	ensureFileAuthStore: async () => ({ get: mockAuthGet }),
+}))
 const mockEnsureRpiPluginOnDisk = vi.fn(async () => '/tmp/mock-rpi-plugin')
 const mockEnsureHumanlayerPluginOnDisk = vi.fn(async () => '/tmp/mock-humanlayer-plugin')
 const mockRunSession = vi.fn(async () => {})
@@ -329,6 +335,66 @@ describe('executeCodelayer interrupt handling', () => {
 		)
 	})
 
+	test('Codex persistence retains self-contained reasoning replay IDs', async () => {
+		mockResolveModel.mockResolvedValueOnce({ provider: 'codex-sse-vendor', modelId: 'gpt-6.1-sol' } as never)
+		mockRunResultOverride = {
+			...defaultRunResult(),
+			state: startState([
+				{
+					role: 'assistant',
+					content: [
+						{
+							type: 'reasoning',
+							text: 'summary',
+							providerOptions: {
+								openai: {
+									itemId: 'rs_local',
+									reasoningEncryptedContent: 'synthetic-ciphertext',
+									phase: 'analysis',
+								},
+							},
+						},
+						{
+							type: 'text',
+							text: 'done',
+							providerOptions: { openai: { itemId: 'msg_remote', phase: 'final_answer' } },
+						},
+					],
+				},
+			]),
+		}
+		const session = createTestSession({ provider: 'codex', model: 'gpt-6.1-sol' })
+		await executeCodelayer({
+			session,
+			services: createServices(),
+			interruptState: await createTestInterruptState(),
+		})
+		expect(mockCodelayerStateUpsert).toHaveBeenCalledWith(
+			expect.objectContaining({
+				state: expect.objectContaining({
+					messages: [
+						{
+							role: 'assistant',
+							content: [
+								{
+									type: 'reasoning',
+									text: 'summary',
+									providerOptions: {
+										openai: {
+											itemId: 'rs_local',
+											reasoningEncryptedContent: 'synthetic-ciphertext',
+										},
+									},
+								},
+								{ type: 'text', text: 'done' },
+							],
+						},
+					],
+				}),
+			}),
+		)
+	})
+
 	test('same-session resume reads latest state by current session id', async () => {
 		const savedState = {
 			...startState([userMessage('previous prompt')]),
@@ -378,6 +444,69 @@ describe('executeCodelayer interrupt handling', () => {
 			}),
 		)
 	})
+
+	test.each([
+		['resume', true],
+		['resume', false],
+		['fork', true],
+		['fork', false],
+	] as const)(
+		'%s checks reasoning provenance before passing persisted history to the agent (match=%s)',
+		async (path, matching) => {
+			mockResolveModel.mockResolvedValueOnce({ provider: 'codex-sse-vendor', modelId: 'gpt-6.1-sol' } as never)
+			const saved = {
+				messages: [
+					{
+						role: 'assistant',
+						content: [
+							{
+								type: 'reasoning',
+								text: 'summary',
+								providerOptions: {
+									openai: {
+										itemId: 'rs_self_contained',
+										reasoningEncryptedContent: 'synthetic-ciphertext',
+									},
+								},
+							},
+						],
+					},
+				],
+				codexReasoningReplay: {
+					version: 1,
+					modelId: 'gpt-6.1-sol',
+					accountHash: createHash('sha256')
+						.update(matching ? 'test-account' : 'previous-account')
+						.digest('hex'),
+				},
+			}
+			if (path === 'fork') mockCodelayerStateSnapshotGet.mockResolvedValueOnce(saved)
+			else mockCodelayerStateGet.mockResolvedValueOnce(saved)
+			const session = createTestSession({
+				id: 'session-1',
+				provider: 'codex',
+				model: 'gpt-6.1-sol',
+				prompt: 'continue',
+			})
+			const ctx = { session, services: createServices(), interruptState: await createTestInterruptState() }
+			if (path === 'fork') {
+				await executeCodelayer(ctx, undefined, {
+					agent: 'codelayer',
+					sourceSessionId: 'source',
+					forkAtEventId: 'event',
+					forkAtRunIndex: 2,
+					sourceSnapshotRunIndex: 1,
+				})
+			} else await executeCodelayer(ctx, session.id)
+			const agent = (await mockCreateCodelayerAgent.mock.results[0]?.value) as { run: ReturnType<typeof vi.fn> }
+			const initial = agent.run.mock.calls[0]?.[0].state
+			expect(initial.codexReasoningReplay).toBeUndefined()
+			expect(initial.messages[0].content[0].providerOptions.openai.itemId).toBe(
+				matching ? 'rs_self_contained' : undefined,
+			)
+			expect(initial.messages.at(-1)).toEqual(userMessage('continue'))
+		},
+	)
 
 	test('fork execution reads child snapshot and appends prompt', async () => {
 		const snapshotState = startState([userMessage('previous prompt')])

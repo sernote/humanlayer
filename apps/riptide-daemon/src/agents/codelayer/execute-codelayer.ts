@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path'
 
 import { createOpenAI } from '@ai-sdk/openai'
 import type { AgentState } from '@humanlayer/agentlayer-core'
-import { createSkillTool, sanitizeStateForPersistence, startState, userMessage } from '@humanlayer/agentlayer-core'
+import { createSkillTool, startState, userMessage } from '@humanlayer/agentlayer-core'
 import { type AuthInfo, ensureFileAuthStore } from '@humanlayer/agentlayer-provider-auth'
 import { isEffortSupported } from '@humanlayer/ai/config'
 import {
@@ -17,10 +17,9 @@ import {
 import type { Task } from '@humanlayer/db/tables/tasks'
 import type { WorkspaceView } from '@humanlayer/db/utils/workspace-view'
 import type { TaskWorkflowType, WorktreeTiming } from '@humanlayer/schemas/effect/taskconfiguration'
-import { modelMessageSchema, type LanguageModel } from 'ai'
+import type { LanguageModel } from 'ai'
 import dedent from 'dedent'
 import { Effect, Option } from 'effect'
-import z from 'zod/v4'
 
 import { hostModelCatalogSnapshot } from '@/effects/services/host-model-catalog/host-model-catalog.service'
 import { resolveSessionWorkspaceView } from '@/effects/services/task-workspace-context/resolve-session-workspace-view'
@@ -63,6 +62,12 @@ import {
 } from './hooks'
 import { createCodelayerCommitAttributionHook } from './hooks/commit-attribution-hook'
 import { createCodelayerTaskDiffCaptureHook } from './hooks/task-diff-capture-hook'
+import {
+	codexReasoningReplayContext,
+	encodeAgentState,
+	isNativeCodexModel,
+	parsePersistedAgentState,
+} from './persisted-agent-state'
 import { getResearchSubagentModelId } from './research-model-routing'
 import { RAW_TOTAL_KEY, toConventionalTokenMap, toUsageEventTokenMap } from './token-usage'
 
@@ -102,27 +107,6 @@ function isWorkflowType(value: string | null | undefined): value is TaskWorkflow
 
 function isWorktreeTiming(value: string | null | undefined): value is WorktreeTiming {
 	return value === 'now' || value === 'later' || value === 'never'
-}
-
-const persistedAgentStateSchema = z.object({ messages: modelMessageSchema.array() }).loose()
-
-function parsePersistedAgentState(value: unknown): AgentState | null {
-	const state = persistedAgentStateSchema.safeParse(value)
-	return state.success ? state.data : null
-}
-
-function encodeAgentState(state: AgentState): { [Key in keyof AgentState]: AgentState[Key] } {
-	const encoded: { [Key in keyof AgentState]: AgentState[Key] } = {
-		messages: state.messages,
-	}
-	if (state.pendingToolCalls !== undefined) encoded.pendingToolCalls = state.pendingToolCalls
-	if (state.approvalHistory !== undefined) encoded.approvalHistory = state.approvalHistory
-	if (state.toolState !== undefined) encoded.toolState = state.toolState
-	if (state.subAgents !== undefined) encoded.subAgents = state.subAgents
-	if (state.terminalChildren !== undefined) encoded.terminalChildren = state.terminalChildren
-	if (state.compaction !== undefined) encoded.compaction = state.compaction
-	if (state.contextWindowTokens !== undefined) encoded.contextWindowTokens = state.contextWindowTokens
-	return encoded
 }
 
 async function resolveFireworksApiKey(): Promise<string> {
@@ -170,6 +154,9 @@ export async function executeCodelayer(
 	const codexDiagnostics = provider === 'codex' ? createDaemonCodexDiagnostics(session.id, modelId) : undefined
 	const resolveModelContext = codexDiagnostics ? { codexDiagnostics } : undefined
 	const model = await resolveRiptideModel(provider, modelId, resolveModelContext)
+	const replayContext = isNativeCodexModel(model)
+		? codexReasoningReplayContext(model, await (await ensureFileAuthStore()).get('codex'))
+		: undefined
 	const hostModelCatalog = Option.getOrUndefined(await services.daemonRuntime.runPromise(hostModelCatalogSnapshot))
 	const researchSubagentModelId = getResearchSubagentModelId(provider, modelId, hostModelCatalog)
 	const researchSubagentModel = researchSubagentModelId
@@ -593,6 +580,7 @@ export async function executeCodelayer(
 				sessionId: session.id,
 				runIndex: forkMeta.sourceSnapshotRunIndex,
 			}),
+			replayContext,
 		)
 		if (!snapshotState) {
 			throw new Error('CodeLayer fork snapshot is missing or expired')
@@ -618,6 +606,7 @@ export async function executeCodelayer(
 			await services.orpc.codelayerState.get({
 				sessionId: session.id,
 			}),
+			replayContext,
 		)
 		if (savedState) {
 			// Append the new user message to the saved conversation history
@@ -724,10 +713,9 @@ export async function executeCodelayer(
 
 		// Terminal child continuation state must survive every daemon boundary, including
 		// root errors and interruptions. Persist before any status-specific early return.
-		const sanitizedState = sanitizeStateForPersistence(result.state)
 		await services.orpc.codelayerState.upsert({
 			sessionId: session.id,
-			state: encodeAgentState(sanitizedState),
+			state: encodeAgentState(result.state, replayContext, result.error?.message),
 		})
 		logger.info({ sessionId: session.id }, 'CodeLayer agent state saved')
 

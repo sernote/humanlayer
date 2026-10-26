@@ -1,0 +1,709 @@
+diff --git a/apps/riptide-daemon/src/agents/codelayer/execute-codelayer.ts b/apps/riptide-daemon/src/agents/codelayer/execute-codelayer.ts
+index c58c37b..d9b60a9 100644
+--- a/apps/riptide-daemon/src/agents/codelayer/execute-codelayer.ts
++++ b/apps/riptide-daemon/src/agents/codelayer/execute-codelayer.ts
+@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path'
+ 
+ import { createOpenAI } from '@ai-sdk/openai'
+ import type { AgentState } from '@humanlayer/agentlayer-core'
+-import { createSkillTool, sanitizeStateForPersistence, startState, userMessage } from '@humanlayer/agentlayer-core'
++import { createSkillTool, startState, userMessage } from '@humanlayer/agentlayer-core'
+ import { type AuthInfo, ensureFileAuthStore } from '@humanlayer/agentlayer-provider-auth'
+ import { isEffortSupported } from '@humanlayer/ai/config'
+ import {
+@@ -17,10 +17,9 @@ import {
+ import type { Task } from '@humanlayer/db/tables/tasks'
+ import type { WorkspaceView } from '@humanlayer/db/utils/workspace-view'
+ import type { TaskWorkflowType, WorktreeTiming } from '@humanlayer/schemas/effect/taskconfiguration'
+-import { modelMessageSchema, type LanguageModel } from 'ai'
++import type { LanguageModel } from 'ai'
+ import dedent from 'dedent'
+ import { Effect, Option } from 'effect'
+-import z from 'zod/v4'
+ 
+ import { hostModelCatalogSnapshot } from '@/effects/services/host-model-catalog/host-model-catalog.service'
+ import { resolveSessionWorkspaceView } from '@/effects/services/task-workspace-context/resolve-session-workspace-view'
+@@ -63,6 +62,13 @@ import {
+ } from './hooks'
+ import { createCodelayerCommitAttributionHook } from './hooks/commit-attribution-hook'
+ import { createCodelayerTaskDiffCaptureHook } from './hooks/task-diff-capture-hook'
++import {
++	codexReasoningReplayContext,
++	encodeAgentState,
++	isNativeCodexModel,
++	parsePersistedAgentState,
++} from './persisted-agent-state'
++import { stabilizePersistedToolHistory } from './prompt-state'
+ import { getResearchSubagentModelId } from './research-model-routing'
+ import { RAW_TOTAL_KEY, toConventionalTokenMap, toUsageEventTokenMap } from './token-usage'
+ 
+@@ -104,27 +110,6 @@ function isWorktreeTiming(value: string | null | undefined): value is WorktreeTi
+ 	return value === 'now' || value === 'later' || value === 'never'
+ }
+ 
+-const persistedAgentStateSchema = z.object({ messages: modelMessageSchema.array() }).loose()
+-
+-function parsePersistedAgentState(value: unknown): AgentState | null {
+-	const state = persistedAgentStateSchema.safeParse(value)
+-	return state.success ? state.data : null
+-}
+-
+-function encodeAgentState(state: AgentState): { [Key in keyof AgentState]: AgentState[Key] } {
+-	const encoded: { [Key in keyof AgentState]: AgentState[Key] } = {
+-		messages: state.messages,
+-	}
+-	if (state.pendingToolCalls !== undefined) encoded.pendingToolCalls = state.pendingToolCalls
+-	if (state.approvalHistory !== undefined) encoded.approvalHistory = state.approvalHistory
+-	if (state.toolState !== undefined) encoded.toolState = state.toolState
+-	if (state.subAgents !== undefined) encoded.subAgents = state.subAgents
+-	if (state.terminalChildren !== undefined) encoded.terminalChildren = state.terminalChildren
+-	if (state.compaction !== undefined) encoded.compaction = state.compaction
+-	if (state.contextWindowTokens !== undefined) encoded.contextWindowTokens = state.contextWindowTokens
+-	return encoded
+-}
+-
+ async function resolveFireworksApiKey(): Promise<string> {
+ 	if (process.env.FIREWORKS_API_KEY) return process.env.FIREWORKS_API_KEY
+ 
+@@ -170,6 +155,9 @@ export async function executeCodelayer(
+ 	const codexDiagnostics = provider === 'codex' ? createDaemonCodexDiagnostics(session.id, modelId) : undefined
+ 	const resolveModelContext = codexDiagnostics ? { codexDiagnostics } : undefined
+ 	const model = await resolveRiptideModel(provider, modelId, resolveModelContext)
++	const replayContext = isNativeCodexModel(model)
++		? codexReasoningReplayContext(model, await (await ensureFileAuthStore()).get('codex'))
++		: undefined
+ 	const hostModelCatalog = Option.getOrUndefined(await services.daemonRuntime.runPromise(hostModelCatalogSnapshot))
+ 	const researchSubagentModelId = getResearchSubagentModelId(provider, modelId, hostModelCatalog)
+ 	const researchSubagentModel = researchSubagentModelId
+@@ -554,6 +542,7 @@ export async function executeCodelayer(
+ 		skillTool,
+ 		additionalTools: humanlayerTools,
+ 		hooks: {
++			preRequest: [stabilizePersistedToolHistory],
+ 			approval: [createCodelayerApprovalHook(services, session, cwd)],
+ 			postToolUse: postToolUseHooks,
+ 		},
+@@ -593,6 +582,7 @@ export async function executeCodelayer(
+ 				sessionId: session.id,
+ 				runIndex: forkMeta.sourceSnapshotRunIndex,
+ 			}),
++			replayContext,
+ 		)
+ 		if (!snapshotState) {
+ 			throw new Error('CodeLayer fork snapshot is missing or expired')
+@@ -618,6 +608,7 @@ export async function executeCodelayer(
+ 			await services.orpc.codelayerState.get({
+ 				sessionId: session.id,
+ 			}),
++			replayContext,
+ 		)
+ 		if (savedState) {
+ 			// Append the new user message to the saved conversation history
+@@ -724,10 +715,9 @@ export async function executeCodelayer(
+ 
+ 		// Terminal child continuation state must survive every daemon boundary, including
+ 		// root errors and interruptions. Persist before any status-specific early return.
+-		const sanitizedState = sanitizeStateForPersistence(result.state)
+ 		await services.orpc.codelayerState.upsert({
+ 			sessionId: session.id,
+-			state: encodeAgentState(sanitizedState),
++			state: encodeAgentState(result.state, replayContext, result.error?.message),
+ 		})
+ 		logger.info({ sessionId: session.id }, 'CodeLayer agent state saved')
+ 
+diff --git a/apps/riptide-daemon/test/unit/agents/codelayer/execute-codelayer-interrupt.test.ts b/apps/riptide-daemon/test/unit/agents/codelayer/execute-codelayer-interrupt.test.ts
+index 983b0e5..3f2bc02 100644
+--- a/apps/riptide-daemon/test/unit/agents/codelayer/execute-codelayer-interrupt.test.ts
++++ b/apps/riptide-daemon/test/unit/agents/codelayer/execute-codelayer-interrupt.test.ts
+@@ -1,4 +1,6 @@
+-import { startState, userMessage } from '@humanlayer/agentlayer-core'
++import { createHash } from 'node:crypto'
++
++import { runPreRequestHooks, startState, userMessage, type PreRequestHook } from '@humanlayer/agentlayer-core'
+ import { Effect } from 'effect'
+ import { afterEach, describe, expect, test, vi } from 'vitest'
+ 
+@@ -21,6 +23,10 @@ const mockCreateCodelayerAgent = vi.fn(async () => ({
+ 	run: vi.fn(() => createAgentRun()),
+ }))
+ const mockResolveModel = vi.fn(async () => ({ id: 'mock-model' }))
++const mockAuthGet = vi.fn(async () => ({ kind: 'oauth', accessToken: 'test-token', accountId: 'test-account' }))
++vi.mock('@humanlayer/agentlayer-provider-auth', () => ({
++	ensureFileAuthStore: async () => ({ get: mockAuthGet }),
++}))
+ const mockEnsureRpiPluginOnDisk = vi.fn(async () => '/tmp/mock-rpi-plugin')
+ const mockEnsureHumanlayerPluginOnDisk = vi.fn(async () => '/tmp/mock-humanlayer-plugin')
+ const mockRunSession = vi.fn(async () => {})
+@@ -329,6 +335,97 @@ describe('executeCodelayer interrupt handling', () => {
+ 		)
+ 	})
+ 
++	test('model-visible tool arguments retain their order after JSONB persistence', async () => {
++		const session = createTestSession({ provider: 'codex', model: 'gpt-6.1-sol' })
++		await executeCodelayer({
++			session,
++			services: createServices(),
++			interruptState: await createTestInterruptState(),
++		})
++		const options = (mockCreateCodelayerAgent.mock.calls as unknown[][])[0]?.[0] as {
++			hooks?: { preRequest?: PreRequestHook[] }
++		}
++		const messages = startState([
++			{
++				role: 'assistant',
++				content: [
++					{
++						type: 'tool-call',
++						toolCallId: 'read-1',
++						toolName: 'read',
++						input: { file_path: 'public.txt', limit: 2000 },
++					},
++				],
++			},
++		]).messages
++		const transformed = await runPreRequestHooks(options.hooks?.preRequest ?? [], { messages })
++		const part = transformed.messages[0]?.content
++		expect(Array.isArray(part) && part[0]?.type === 'tool-call' && JSON.stringify(part[0].input)).toBe(
++			'{"limit":2000,"file_path":"public.txt"}',
++		)
++		expect(transformed.persist).toBe(true)
++	})
++
++	test('Codex persistence retains self-contained reasoning replay IDs', async () => {
++		mockResolveModel.mockResolvedValueOnce({ provider: 'codex-sse-vendor', modelId: 'gpt-6.1-sol' } as never)
++		mockRunResultOverride = {
++			...defaultRunResult(),
++			state: startState([
++				{
++					role: 'assistant',
++					content: [
++						{
++							type: 'reasoning',
++							text: 'summary',
++							providerOptions: {
++								openai: {
++									itemId: 'rs_local',
++									reasoningEncryptedContent: 'synthetic-ciphertext',
++									phase: 'analysis',
++								},
++							},
++						},
++						{
++							type: 'text',
++							text: 'done',
++							providerOptions: { openai: { itemId: 'msg_remote', phase: 'final_answer' } },
++						},
++					],
++				},
++			]),
++		}
++		const session = createTestSession({ provider: 'codex', model: 'gpt-6.1-sol' })
++		await executeCodelayer({
++			session,
++			services: createServices(),
++			interruptState: await createTestInterruptState(),
++		})
++		expect(mockCodelayerStateUpsert).toHaveBeenCalledWith(
++			expect.objectContaining({
++				state: expect.objectContaining({
++					messages: [
++						{
++							role: 'assistant',
++							content: [
++								{
++									type: 'reasoning',
++									text: 'summary',
++									providerOptions: {
++										openai: {
++											itemId: 'rs_local',
++											reasoningEncryptedContent: 'synthetic-ciphertext',
++										},
++									},
++								},
++								{ type: 'text', text: 'done' },
++							],
++						},
++					],
++				}),
++			}),
++		)
++	})
++
+ 	test('same-session resume reads latest state by current session id', async () => {
+ 		const savedState = {
+ 			...startState([userMessage('previous prompt')]),
+@@ -379,6 +476,69 @@ describe('executeCodelayer interrupt handling', () => {
+ 		)
+ 	})
+ 
++	test.each([
++		['resume', true],
++		['resume', false],
++		['fork', true],
++		['fork', false],
++	] as const)(
++		'%s checks reasoning provenance before passing persisted history to the agent (match=%s)',
++		async (path, matching) => {
++			mockResolveModel.mockResolvedValueOnce({ provider: 'codex-sse-vendor', modelId: 'gpt-6.1-sol' } as never)
++			const saved = {
++				messages: [
++					{
++						role: 'assistant',
++						content: [
++							{
++								type: 'reasoning',
++								text: 'summary',
++								providerOptions: {
++									openai: {
++										itemId: 'rs_self_contained',
++										reasoningEncryptedContent: 'synthetic-ciphertext',
++									},
++								},
++							},
++						],
++					},
++				],
++				codexReasoningReplay: {
++					version: 1,
++					modelId: 'gpt-6.1-sol',
++					accountHash: createHash('sha256')
++						.update(matching ? 'test-account' : 'previous-account')
++						.digest('hex'),
++				},
++			}
++			if (path === 'fork') mockCodelayerStateSnapshotGet.mockResolvedValueOnce(saved)
++			else mockCodelayerStateGet.mockResolvedValueOnce(saved)
++			const session = createTestSession({
++				id: 'session-1',
++				provider: 'codex',
++				model: 'gpt-6.1-sol',
++				prompt: 'continue',
++			})
++			const ctx = { session, services: createServices(), interruptState: await createTestInterruptState() }
++			if (path === 'fork') {
++				await executeCodelayer(ctx, undefined, {
++					agent: 'codelayer',
++					sourceSessionId: 'source',
++					forkAtEventId: 'event',
++					forkAtRunIndex: 2,
++					sourceSnapshotRunIndex: 1,
++				})
++			} else await executeCodelayer(ctx, session.id)
++			const agent = (await mockCreateCodelayerAgent.mock.results[0]?.value) as { run: ReturnType<typeof vi.fn> }
++			const initial = agent.run.mock.calls[0]?.[0].state
++			expect(initial.codexReasoningReplay).toBeUndefined()
++			expect(initial.messages[0].content[0].providerOptions.openai.itemId).toBe(
++				matching ? 'rs_self_contained' : undefined,
++			)
++			expect(initial.messages.at(-1)).toEqual(userMessage('continue'))
++		},
++	)
++
+ 	test('fork execution reads child snapshot and appends prompt', async () => {
+ 		const snapshotState = startState([userMessage('previous prompt')])
+ 		mockCodelayerStateSnapshotGet.mockResolvedValueOnce(snapshotState as unknown as Record<string, unknown>)
+diff --git a/apps/riptide-daemon/src/agents/codelayer/persisted-agent-state.ts b/apps/riptide-daemon/src/agents/codelayer/persisted-agent-state.ts
+new file mode 100644
+index 0000000..28d4470
+--- /dev/null
++++ b/apps/riptide-daemon/src/agents/codelayer/persisted-agent-state.ts
+@@ -0,0 +1,94 @@
++import { createHash } from 'node:crypto'
++
++import { type AgentState, sanitizeStateForPersistence } from '@humanlayer/agentlayer-core'
++import type { AuthInfo } from '@humanlayer/agentlayer-provider-auth'
++import { type LanguageModel, modelMessageSchema } from 'ai'
++import z from 'zod/v4'
++
++const persistedAgentStateSchema = z.object({ messages: modelMessageSchema.array() }).loose()
++const replaySchema = z.object({ version: z.literal(1), modelId: z.string(), accountHash: z.string() })
++export type CodexReasoningReplay = z.infer<typeof replaySchema>
++
++export function isNativeCodexModel(model: LanguageModel): boolean {
++	return typeof model !== 'string' && (model.provider === 'codex-sse-vendor' || model.provider === 'codex-effect')
++}
++
++export function codexReasoningReplayContext(
++	model: LanguageModel,
++	auth: AuthInfo | undefined,
++): CodexReasoningReplay | undefined {
++	if (typeof model === 'string' || !isNativeCodexModel(model) || auth?.kind !== 'oauth' || !auth.accountId) {
++		return undefined
++	}
++	return {
++		version: 1,
++		modelId: model.modelId,
++		accountHash: createHash('sha256').update(auth.accountId).digest('hex'),
++	}
++}
++
++export function parsePersistedAgentState(value: unknown, replay?: CodexReasoningReplay): AgentState | null {
++	const parsed = persistedAgentStateSchema.safeParse(value)
++	if (!parsed.success) return null
++	const { codexReasoningReplay, ...state } = parsed.data
++	const stored = replaySchema.safeParse(codexReasoningReplay)
++	if (
++		replay &&
++		stored.success &&
++		stored.data.modelId === replay.modelId &&
++		stored.data.accountHash === replay.accountHash
++	) {
++		return state
++	}
++	// Old snapshots and a changed route, model or account retain the SDK's safe resume behavior.
++	return sanitizeStateForPersistence(state)
++}
++
++export function encodeAgentState(
++	state: AgentState,
++	replay?: CodexReasoningReplay,
++	errorMessage?: string,
++): { [Key in keyof AgentState]: AgentState[Key] } & { codexReasoningReplay?: CodexReasoningReplay } {
++	const sanitized = sanitizeStateForPersistence(state)
++	// Error wording varies by backend. An errored run must not retain potentially rejected replay IDs.
++	const preserveReasoning = replay && errorMessage === undefined
++	if (preserveReasoning) {
++		sanitized.messages = sanitized.messages.map((message, messageIndex) => {
++			const original = state.messages[messageIndex]?.content
++			if (!Array.isArray(message.content) || !Array.isArray(original)) return message
++			const content = message.content.map((part, partIndex) => {
++				const previous = original[partIndex]
++				if (part.type !== 'reasoning' || previous?.type !== 'reasoning') return part
++				const options = previous.providerOptions?.openai
++				if (
++					typeof options?.itemId !== 'string' ||
++					!options.itemId ||
++					typeof options.reasoningEncryptedContent !== 'string' ||
++					!options.reasoningEncryptedContent
++				)
++					return part
++				return {
++					...part,
++					providerOptions: {
++						...part.providerOptions,
++						openai: { ...part.providerOptions?.openai, itemId: options.itemId },
++					},
++				}
++			})
++			return { ...message, content } as typeof message
++		})
++	}
++	// Child agents may use other models. Keep their IDs sanitized until they have their own provenance.
++	const encoded: { [Key in keyof AgentState]: AgentState[Key] } & { codexReasoningReplay?: CodexReasoningReplay } = {
++		messages: sanitized.messages,
++	}
++	if (sanitized.pendingToolCalls !== undefined) encoded.pendingToolCalls = sanitized.pendingToolCalls
++	if (sanitized.approvalHistory !== undefined) encoded.approvalHistory = sanitized.approvalHistory
++	if (sanitized.toolState !== undefined) encoded.toolState = sanitized.toolState
++	if (sanitized.subAgents !== undefined) encoded.subAgents = sanitized.subAgents
++	if (sanitized.terminalChildren !== undefined) encoded.terminalChildren = sanitized.terminalChildren
++	if (sanitized.compaction !== undefined) encoded.compaction = sanitized.compaction
++	if (sanitized.contextWindowTokens !== undefined) encoded.contextWindowTokens = sanitized.contextWindowTokens
++	if (preserveReasoning) encoded.codexReasoningReplay = replay
++	return encoded
++}
+diff --git a/apps/riptide-daemon/src/agents/codelayer/prompt-state.ts b/apps/riptide-daemon/src/agents/codelayer/prompt-state.ts
+new file mode 100644
+index 0000000..b6033f5
+--- /dev/null
++++ b/apps/riptide-daemon/src/agents/codelayer/prompt-state.ts
+@@ -0,0 +1,55 @@
++import type { PreRequestHook } from '@humanlayer/agentlayer-core'
++
++/** Match JSONB's UTF-8 key ordering before the first request that contains a value. */
++function orderJsonForPersistence(value: unknown): unknown {
++	if (Array.isArray(value)) {
++		const ordered = value.map(orderJsonForPersistence)
++		return ordered.every((item, index) => item === value[index]) ? value : ordered
++	}
++	if (value === null || typeof value !== 'object') return value
++	const prototype = Object.getPrototypeOf(value)
++	if (prototype !== Object.prototype && prototype !== null) return value
++	const entries = Object.entries(value)
++	const ordered = entries
++		.map(([key, child]) => ({ key, bytes: Buffer.from(key), value: orderJsonForPersistence(child) }))
++		.sort((a, b) => a.bytes.length - b.bytes.length || Buffer.compare(a.bytes, b.bytes))
++	const result = Object.fromEntries(ordered.map(({ key, value: child }) => [key, child]))
++	// JavaScript enumerates integer keys first, even when JSONB places a short string before them.
++	if (
++		Object.entries(result).every(
++			([key, child], index) => key === entries[index]?.[0] && child === entries[index]?.[1],
++		)
++	) {
++		return value
++	}
++	return result
++}
++
++/** JSONB preserves values but not object order; serialized tool history must stay stable on resume. */
++export const stabilizePersistedToolHistory: PreRequestHook = (ctx) => {
++	let changed = false
++	const messages = ctx.messages.map((message) => {
++		if (!Array.isArray(message.content)) return message
++		let messageChanged = false
++		const content = message.content.map((part) => {
++			if (part.type === 'tool-call') {
++				const input = orderJsonForPersistence(part.input)
++				if (input !== part.input) {
++					messageChanged = true
++					return { ...part, input }
++				}
++			} else if (part.type === 'tool-result') {
++				const output = orderJsonForPersistence(part.output) as typeof part.output
++				if (output !== part.output) {
++					messageChanged = true
++					return { ...part, output }
++				}
++			}
++			return part
++		})
++		if (!messageChanged) return message
++		changed = true
++		return { ...message, content } as typeof message
++	})
++	return changed ? ctx.transform(messages, { persist: true }) : ctx.next()
++}
+diff --git a/apps/riptide-daemon/test/unit/agents/codelayer/persisted-agent-state.test.ts b/apps/riptide-daemon/test/unit/agents/codelayer/persisted-agent-state.test.ts
+new file mode 100644
+index 0000000..c1d24be
+--- /dev/null
++++ b/apps/riptide-daemon/test/unit/agents/codelayer/persisted-agent-state.test.ts
+@@ -0,0 +1,125 @@
++import { type AgentState, sanitizeStateForPersistence } from '@humanlayer/agentlayer-core'
++import { createCodexSseVendorProvider, createCodexEffectProvider } from '@humanlayer/agentlayer-provider-openai-codex'
++import { describe, expect, test } from 'vitest'
++
++import {
++	codexReasoningReplayContext,
++	encodeAgentState,
++	isNativeCodexModel,
++	parsePersistedAgentState,
++} from '../../../../src/agents/codelayer/persisted-agent-state'
++
++const native = createCodexSseVendorProvider().languageModel('gpt-6.1-sol')
++const auth = { kind: 'oauth' as const, accessToken: 'synthetic', accountId: 'account-one' }
++const replay = codexReasoningReplayContext(native, auth)!
++const reasoning = {
++	type: 'reasoning' as const,
++	text: 'summary',
++	providerOptions: {
++		openai: { itemId: 'rs_self_contained', reasoningEncryptedContent: 'synthetic-ciphertext', phase: 'analysis' },
++	},
++}
++const state: AgentState = {
++	messages: [
++		{
++			role: 'assistant',
++			content: [
++				reasoning,
++				{
++					type: 'text',
++					text: 'done',
++					providerOptions: { openai: { itemId: 'msg_remote', phase: 'final_answer' } },
++				},
++			],
++		},
++	],
++}
++
++describe('self-contained native Codex reasoning persistence', () => {
++	test('recognizes the real native transports and rejects custom routes or unidentifiable auth', () => {
++		expect(isNativeCodexModel(native)).toBe(true)
++		expect(isNativeCodexModel(createCodexEffectProvider().languageModel('gpt-6.1-sol'))).toBe(true)
++		expect(codexReasoningReplayContext({ ...native, provider: 'custom.responses' }, auth)).toBeUndefined()
++		expect(codexReasoningReplayContext(native, { kind: 'api', apiKey: 'test-key' })).toBeUndefined()
++		expect(codexReasoningReplayContext(native, { kind: 'oauth', accessToken: 'test' })).toBeUndefined()
++		expect(replay.accountHash).not.toContain(auth.accountId)
++	})
++
++	test('keeps root self-contained IDs, strips remote IDs and phase, and does not mutate the original', () => {
++		const saved = encodeAgentState(state, replay)
++		expect(saved.messages).toEqual([
++			{
++				role: 'assistant',
++				content: [
++					{
++						...reasoning,
++						providerOptions: {
++							openai: { itemId: 'rs_self_contained', reasoningEncryptedContent: 'synthetic-ciphertext' },
++						},
++					},
++					{ type: 'text', text: 'done' },
++				],
++			},
++		])
++		expect(reasoning.providerOptions.openai.phase).toBe('analysis')
++		expect(saved.codexReasoningReplay).toEqual(replay)
++		expect(parsePersistedAgentState(JSON.parse(JSON.stringify(saved)), replay)).toEqual({
++			messages: saved.messages,
++		})
++	})
++
++	test.each([undefined, { ...replay, modelId: 'other-model' }, { ...replay, accountHash: 'other-account' }])(
++		'strips replay identifiers for a missing or changed context',
++		(current) => {
++			const saved = encodeAgentState(state, replay)
++			expect(parsePersistedAgentState(saved, current)).toEqual(sanitizeStateForPersistence(state))
++		},
++	)
++
++	test('legacy untagged snapshots and malformed tags retain the original safe behavior', () => {
++		expect(parsePersistedAgentState(state, replay)).toEqual(sanitizeStateForPersistence(state))
++		expect(parsePersistedAgentState({ ...state, codexReasoningReplay: { ...replay, version: 2 } }, replay)).toEqual(
++			sanitizeStateForPersistence(state),
++		)
++		expect(parsePersistedAgentState({ messages: 'invalid' }, replay)).toBeNull()
++		expect(encodeAgentState(state)).toEqual(sanitizeStateForPersistence(state))
++	})
++
++	test('never restores IDs without encrypted content or inside a different-model child', () => {
++		const unsafe: AgentState = {
++			messages: [
++				{
++					role: 'assistant',
++					content: [
++						{ ...reasoning, providerOptions: { openai: { itemId: 'rs_missing' } } },
++						{
++							...reasoning,
++							providerOptions: { openai: { itemId: 'rs_empty', reasoningEncryptedContent: '' } },
++						},
++						{
++							...reasoning,
++							providerOptions: { openai: { itemId: 'rs_null', reasoningEncryptedContent: null } },
++						},
++					],
++				},
++			],
++			subAgents: { child: state },
++			terminalChildren: {
++				child: { state, lastOutcome: 'complete', completedTurns: 1, runtime: { type: 'fork' } },
++			},
++		}
++		const saved = encodeAgentState(unsafe, replay)
++		const { codexReasoningReplay: tag, ...withoutTag } = saved
++		expect(tag).toEqual(replay)
++		expect(withoutTag).toEqual(sanitizeStateForPersistence(unsafe))
++	})
++
++	test.each([
++		'Invalid encrypted_content: decryption failed',
++		"Item with id 'rs_replayed' not found",
++		'LLM stream failed',
++		'',
++	])('an errored run removes the tag and IDs regardless of provider wording: %s', (message) => {
++		expect(encodeAgentState(state, replay, message)).toEqual(sanitizeStateForPersistence(state))
++	})
++})
+diff --git a/apps/riptide-daemon/test/unit/agents/codelayer/prompt-state.test.ts b/apps/riptide-daemon/test/unit/agents/codelayer/prompt-state.test.ts
+new file mode 100644
+index 0000000..52bbf40
+--- /dev/null
++++ b/apps/riptide-daemon/test/unit/agents/codelayer/prompt-state.test.ts
+@@ -0,0 +1,107 @@
++import { runPreRequestHooks } from '@humanlayer/agentlayer-core'
++import type { ModelMessage } from 'ai'
++import { describe, expect, test } from 'vitest'
++
++import { stabilizePersistedToolHistory } from '../../../../src/agents/codelayer/prompt-state'
++
++describe('persisted model-visible JSON', () => {
++	test('stabilizes nested tool arguments while preserving array order and the original state', async () => {
++		const input = {
++			file_path: 'public.txt',
++			limit: 2000,
++			nested: [
++				{ longer: 1, x: 2 },
++				{ b: 3, a: 4 },
++			],
++		}
++		const messages: ModelMessage[] = [
++			{ role: 'assistant', content: [{ type: 'tool-call', toolCallId: 'read-1', toolName: 'read', input }] },
++		]
++		const result = await runPreRequestHooks([stabilizePersistedToolHistory], { messages })
++		const content = result.messages[0]?.content
++		expect(Array.isArray(content) && content[0]?.type === 'tool-call' && JSON.stringify(content[0].input)).toBe(
++			'{"limit":2000,"nested":[{"x":2,"longer":1},{"a":4,"b":3}],"file_path":"public.txt"}',
++		)
++		expect(JSON.stringify(input)).toBe(
++			'{"file_path":"public.txt","limit":2000,"nested":[{"longer":1,"x":2},{"b":3,"a":4}]}',
++		)
++		const repeated = await runPreRequestHooks([stabilizePersistedToolHistory], { messages: result.messages })
++		expect(repeated.transformed).toBe(false)
++	})
++
++	test('matches PostgreSQL UTF-8 order for Unicode and numeric keys without losing special keys', async () => {
++		const input = JSON.parse('{"long":1,"é":2,"aa":3,"中":4,"2":5,"10":6,"a":9,"__proto__":{"z":7,"a":8}}')
++		const messages: ModelMessage[] = [
++			{ role: 'assistant', content: [{ type: 'tool-call', toolCallId: 'call-1', toolName: 'fixture', input }] },
++		]
++		const result = await runPreRequestHooks([stabilizePersistedToolHistory], { messages })
++		const content = result.messages[0]?.content
++		expect(Array.isArray(content) && content[0]?.type === 'tool-call' && JSON.stringify(content[0].input)).toBe(
++			'{"2":5,"10":6,"a":9,"aa":3,"é":2,"中":4,"long":1,"__proto__":{"a":8,"z":7}}',
++		)
++		const repeated = await runPreRequestHooks([stabilizePersistedToolHistory], { messages: result.messages })
++		expect(repeated.transformed).toBe(false)
++	})
++
++	test('stabilizes structured tool results and leaves text, reasoning and binary values intact', async () => {
++		const bytes = new Uint8Array([3, 2, 1])
++		const messages: ModelMessage[] = [
++			{ role: 'user', content: [{ type: 'image', image: bytes }] },
++			{
++				role: 'assistant',
++				content: [
++					{
++						type: 'reasoning',
++						text: 'unchanged',
++						providerOptions: { openai: { itemId: 'rs-1', reasoningEncryptedContent: 'opaque' } },
++					},
++				],
++			},
++			{
++				role: 'tool',
++				content: [
++					{
++						type: 'tool-result',
++						toolCallId: 'call-1',
++						toolName: 'fixture',
++						output: { type: 'json', value: { longer: 'value', a: [2, 1] } },
++					},
++				],
++			},
++			{
++				role: 'tool',
++				content: [
++					{
++						type: 'tool-result',
++						toolCallId: 'call-2',
++						toolName: 'fixture',
++						output: { type: 'text', value: '{"longer":1,"a":2}' },
++					},
++				],
++			},
++		]
++		const result = await runPreRequestHooks([stabilizePersistedToolHistory], { messages })
++		expect(result.messages[0]).toBe(messages[0])
++		expect(result.messages[1]).toBe(messages[1])
++		expect(result.messages[3]).toBe(messages[3])
++		const content = result.messages[2]?.content
++		expect(Array.isArray(content) && content[0]?.type === 'tool-result' && JSON.stringify(content[0].output)).toBe(
++			'{"type":"json","value":{"a":[2,1],"longer":"value"}}',
++		)
++	})
++
++	test('does not parse JSON strings or rewrite an already stable text-only history', async () => {
++		const messages: ModelMessage[] = [
++			{ role: 'user', content: 'unchanged' },
++			{
++				role: 'assistant',
++				content: [
++					{ type: 'tool-call', toolCallId: 'call-1', toolName: 'fixture', input: '{"longer":1,"a":2}' },
++				],
++			},
++		]
++		const result = await runPreRequestHooks([stabilizePersistedToolHistory], { messages })
++		expect(result.transformed).toBe(false)
++		expect(result.messages).toBe(messages)
++	})
++})

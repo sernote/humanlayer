@@ -1,4 +1,4 @@
-import { startState, userMessage } from '@humanlayer/agentlayer-core'
+import { runPreRequestHooks, startState, userMessage, type PreRequestHook } from '@humanlayer/agentlayer-core'
 import { Effect } from 'effect'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
@@ -327,6 +327,37 @@ describe('executeCodelayer interrupt handling', () => {
 				},
 			}),
 		)
+	})
+
+	test('model-visible tool arguments retain their order after JSONB persistence', async () => {
+		const session = createTestSession({ provider: 'codex', model: 'gpt-6.1-sol' })
+		await executeCodelayer({
+			session,
+			services: createServices(),
+			interruptState: await createTestInterruptState(),
+		})
+		const options = (mockCreateCodelayerAgent.mock.calls as unknown[][])[0]?.[0] as {
+			hooks?: { preRequest?: PreRequestHook[] }
+		}
+		const messages = startState([
+			{
+				role: 'assistant',
+				content: [
+					{
+						type: 'tool-call',
+						toolCallId: 'read-1',
+						toolName: 'read',
+						input: { file_path: 'public.txt', limit: 2000 },
+					},
+				],
+			},
+		]).messages
+		const transformed = await runPreRequestHooks(options.hooks?.preRequest ?? [], { messages })
+		const part = transformed.messages[0]?.content
+		expect(Array.isArray(part) && part[0]?.type === 'tool-call' && JSON.stringify(part[0].input)).toBe(
+			'{"limit":2000,"file_path":"public.txt"}',
+		)
+		expect(transformed.persist).toBe(true)
 	})
 
 	test('same-session resume reads latest state by current session id', async () => {

@@ -63,6 +63,7 @@ import {
 } from './hooks'
 import { createCodelayerCommitAttributionHook } from './hooks/commit-attribution-hook'
 import { createCodelayerTaskDiffCaptureHook } from './hooks/task-diff-capture-hook'
+import { stabilizePersistedToolHistory } from './prompt-state'
 import { getResearchSubagentModelId } from './research-model-routing'
 import { RAW_TOTAL_KEY, toConventionalTokenMap, toUsageEventTokenMap } from './token-usage'
 
@@ -554,6 +555,7 @@ export async function executeCodelayer(
 		skillTool,
 		additionalTools: humanlayerTools,
 		hooks: {
+			preRequest: [stabilizePersistedToolHistory],
 			approval: [createCodelayerApprovalHook(services, session, cwd)],
 			postToolUse: postToolUseHooks,
 		},
